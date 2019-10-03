@@ -1,0 +1,471 @@
+#include "common.h"
+#include "data.h"
+#include "log.h"
+
+
+
+extern flag_s io_flag;
+
+int setnonblocking(int sockfd);
+void server_loop(int server_sock);
+void handle_client(int client_sock);
+void forward_header(int destination_sock,char *header_buffer);
+void rewrite_header(char *header_buffer);
+int create_connection() ;
+int _main(int argc, char *argv[]) ;
+void set_time_out(int sockfd);
+ssize_t readLine(int sock, char *buf, size_t size);
+
+int is_ip(const char *ip)
+{
+    int dots = 0; /*字符.的个数*/
+    int setions = 0; /*ip每一部分总和（0-255）*/ 
+
+    if (NULL == ip || *ip == '.') { /*排除输入参数为NULL, 或者一个字符为'.'的字符串*/ 
+        return -1;
+    }   
+
+    while (*ip) {
+
+        if (*ip == '.') {
+            dots ++; 
+            if (setions >= 0 && setions <= 255) { /*检查ip是否合法*/
+                setions = 0;
+                ip++;
+                continue;
+            }   
+            return -1;
+        }   
+        else if (*ip >= '0' && *ip <= '9') { /*判断是不是数字*/
+            setions = setions * 10 + (*ip - '0'); /*求每一段总和*/
+        } else 
+            return -1;
+        ip++;   
+    }   
+    if (setions >= 0 && setions <= 255) {
+        if (dots == 3) {
+            return 1;
+        }   
+    }   
+
+    return -1;
+}
+
+
+
+void set_time_out(int sockfd)
+{
+    struct timeval time_out;  
+    time_out.tv_sec=5;  
+    time_out.tv_usec=0;  
+    if(setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &time_out, sizeof(time_out)) < 0)  
+    {  
+        perror("fail to setsockopt");  
+    }
+}
+int setnonblocking(int sockfd)    
+{    
+    if (fcntl(sockfd, F_SETFL, 
+                fcntl(sockfd, F_GETFD, 0)|O_NONBLOCK) == -1) {    
+        return -1;    
+    }    
+    return 0;    
+}  
+
+
+ssize_t readLine(int sock, char *buf, size_t size)
+{
+    int i = 0;
+    char c = '\0';
+    int n ;
+    while ((i < size - 1) && (c != '\n'))
+    {
+        n = receive_data(sock, &c, 1, 0);
+        if (n > 0)
+        {
+            if (c == '\r')
+            {
+                n = receive_data(sock, &c, 1, MSG_PEEK);
+                if ((n > 0) && (c == '\n')){
+                    receive_data(sock, &c, 1, 0);
+        }
+                else
+                    c = '\n';
+            }
+            buf[i] = c;
+            i++;
+        }
+        else
+            c = '\n';
+    }
+    buf[i] = '\0';
+    return(i);
+}
+
+char * read_header( int fd,char* header )
+{
+    char header_buffer[8192] ;
+    memset(header_buffer,0,MAX_HEADER_SIZE);
+    char line_buffer[2049];
+    char * base_ptr = header_buffer;
+    for(;;)
+    {
+        memset(line_buffer,0,2048);
+        int total_read = readLine(fd,line_buffer,2048);
+        if(total_read <= 0)
+        {   
+            return NULL;
+        }
+        //防止header缓冲区蛮越界
+        if(base_ptr + total_read - header_buffer <= MAX_HEADER_SIZE)
+        {
+           strncpy(base_ptr,line_buffer,total_read); 
+           base_ptr += total_read;
+        } else 
+        {   
+	        LOG("read-header-HEADER_BUFFER_FULL\n");
+            return NULL;
+        }
+        //读到了空行，http头结束
+        if(strcmp(line_buffer,"\r\n") == 0 || strcmp(line_buffer,"\n") == 0)
+        {
+            break;
+        }
+    }
+    strcpy(header,header_buffer);
+    return header;
+}
+
+
+int extract_host(const char * header ,char *host,int *port)
+{
+    char *p = strstr(header,"Host:");
+    if(!p) return -1;
+    char *p1 = strchr(p+5,'\n');
+    if(!p1) return -1;
+    char *p2 = strchr(p+5,':');
+    if(p2 && p2<p1)
+    {
+        char s_port[16];
+        int h_len = (int)(p2-p-6);
+        int p_len = (int)(p1-p2);
+        strncpy(host,p+6,h_len);
+        strncpy(s_port,p2+1,p_len);
+        s_port[p_len] = '\0';
+        host[h_len] = '\0';
+        *port = atoi(s_port);
+    }else
+    {   int h_len = (int)(p1-p-6);
+        strncpy(host,p+6,h_len);
+        host[h_len]='\0';
+        *port = 80;
+    }
+    return 1;
+}
+
+
+/* 响应隧道连接请求  */
+int send_tunnel_ok(int client_sock)
+{
+    char * resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    int len = strlen(resp);
+    char buffer[len+1];
+    strcpy(buffer,resp);
+    if(send_data(client_sock,buffer,len) < 0)
+    {
+        perror("Send http tunnel response  failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+
+/* 处理客户端的连接 */
+void handle_client(int client_sock)
+{
+    int is_http_tunnel = 0;
+    pid_t pid;
+    char header_buffer[8192];
+    read_header(client_sock,header_buffer);
+
+    if(header_buffer ==  NULL)
+    {
+        p_log("Read Http header failed\n");
+        return;
+    }  
+    char * p = strstr(header_buffer,"CONNECT"); /* 判断是否是http 隧道请求 */
+    if(p) 
+    {
+        LOG("receive CONNECT request\n");
+        is_http_tunnel = 1;
+    }   
+    char remote_host[128];
+    int remote_port;
+    if(extract_host(header_buffer,remote_host,&remote_port) < 0) 
+    {
+        LOG("Cannot extract host field,bad http protrotol");
+        return;
+    }
+    int remote_sock;
+    if ((remote_sock = create_connection(remote_host,remote_port)) < 0) {
+
+        close(remote_sock);
+        LOG("Cannot connect to host [%s:%d]\n",remote_host,remote_port);
+        return;
+    }
+    if ((pid = fork()) == 0) { // 创建子进程用于从客户端转发数据到远端socket接口
+        if(strlen(header_buffer) > 0 && !is_http_tunnel) 
+        {
+            forward_header(remote_sock,header_buffer); //普通的http请求先转发header
+        } 
+
+        if((forward_data(client_sock, remote_sock)) <= 0){
+            close(remote_sock);
+            close(client_sock);
+            exit(0);
+        }	
+
+        close(remote_sock);
+        close(client_sock);
+        exit(0);
+    }
+    if (fork() == 0) { // 创建子进程用于转发从远端socket接口过来的数据到客户端
+        io_flag =W_S_ENC;
+        if(is_http_tunnel)
+        {
+            if((send_tunnel_ok(client_sock))<0)
+                exit(0);
+        }    
+        if((forward_data(remote_sock, client_sock))<= 0){
+            close(remote_sock);
+            close(client_sock);
+            exit(0);
+
+        }
+        close(remote_sock);
+        close(client_sock);
+        exit(0);
+    }
+}
+
+void forward_header(int destination_sock,char *header_buffer)
+{
+    rewrite_header(header_buffer);
+    int len = strlen(header_buffer);
+    send_data(destination_sock,header_buffer,len);
+}
+
+
+
+/* 代理中的完整URL转发前需改成 path 的形式 */
+void rewrite_header(char *header_buffer)
+{
+    char * p = strstr(header_buffer,"http://");
+    char * p0 = strchr(p,'\0');
+    char * p5 = strstr(header_buffer,"HTTP/"); /* "HTTP/" 是协议标识 如 "HTTP/1.1" */
+    int len = strlen(header_buffer);
+    if(p)
+    {
+        char * p1 = strchr(p + 7,'/');
+        if(p1 && (p5 > p1)) 
+        {
+            //转换url到 path
+            memcpy(p,p1,(int)(p0 -p1));
+            int l = len - (p1 - p) ;
+            header_buffer[l] = '\0';
+        } else 
+        {
+            char * p2 = strchr(p,' ');  //GET http://3g.sina.com.cn HTTP/1.1
+            memcpy(p + 1,p2,(int)(p0-p2));
+            *p = '/';  //url 没有路径使用根
+            int l  = len - (p2  - p ) + 1;
+            header_buffer[l] = '\0';
+
+        }
+    }
+}
+
+
+
+int create_connection(char *remote_host,int remote_port) {
+    struct sockaddr_in server_addr;
+    struct hostent *server;
+    int sock;
+
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        LOG("CLIENT_SOCKET_ERROR\n");
+	    return CLIENT_SOCKET_ERROR;
+    }
+    if ((server = gethostbyname(remote_host)) == NULL) {
+        errno = EFAULT;
+        return CLIENT_RESOLVE_ERROR;
+    }
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    server_addr.sin_port = htons(remote_port);
+    if (connect(sock, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
+       printf("connect error\n");
+       return CLIENT_CONNECT_ERROR;
+    }
+
+    return sock;
+}
+
+
+int create_server_socket(int port) {
+    int server_sock, optval;
+    struct sockaddr_in server_addr;
+
+    if ((server_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        return SERVER_SOCKET_ERROR;
+    }
+
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+        return SERVER_SETSOCKOPT_ERROR;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
+        return SERVER_BIND_ERROR;
+    }
+
+    if (listen(server_sock, 20) < 0) {
+        return SERVER_LISTEN_ERROR;
+    }
+
+    return server_sock;
+}
+
+/* 处理僵尸进程 */
+void sigchld_handler(int signal) {
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+}
+void server_loop(int server_sock) {
+    struct sockaddr_in client_addr;
+    socklen_t addrlen = sizeof(client_addr);
+    int client_sock;
+    while (1) {
+        client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addrlen);
+        if (client_sock > 0){
+            set_time_out(client_sock);
+            if (fork() == 0) { // 创建子进程处理客户端连接请求
+                handle_client(client_sock );
+                exit(0);
+            }
+            close(client_sock);
+        }
+
+    }
+
+}
+
+
+void usage(void)
+{
+    printf("Usage:\n");
+    printf(" -l <port number>  specifyed local listen port \n");
+    printf(" -h <remote server and port> specifyed next hop server name\n");
+    printf(" -d <remote server and port> run as daemon\n");
+    printf("-E encode data when forwarding data\n");
+    printf ("-D decode data when receiving data\n");
+    exit (8);
+}
+
+void start_server(int daemon,int local_port)
+{
+
+    if(daemon)
+    {
+        pid_t pid;
+        if((pid = fork()) > 0)
+        {
+            LOG("mporxy pid is: [%d]\n",pid);
+            exit(0);
+        } else if(pid < 0)
+        {
+            LOG("Cannot daemonize\n");
+            exit(pid);
+        }
+
+        setsid();
+        //chdir("/"); //改变当前工作目录，这也是为了摆脱父进程的影响
+        umask(0);     //重设文件权限掩码
+        //close(0);
+        // close(1);
+        //close(2);
+        //初始化全局变量
+      
+      //header_buffer = (char *) malloc(MAX_HEADER_SIZE);
+    
+      signal(SIGCHLD, sigchld_handler); // 防止子进程变成僵尸进程
+        int server_sock;
+        if ((server_sock = create_server_socket(local_port)) < 0) 
+        { // start server
+            LOG("Cannot run server on %d\n",local_port);
+            exit(server_sock);
+        }
+
+        set_time_out(server_sock);
+        server_loop(server_sock);
+        //epollz();
+        //printf("close  server_sock =%d\n",close(server_sock));
+        close(server_sock);
+        //free(header_buffer);
+        //exit(0);
+
+   } else 
+    {
+        usage();
+    }
+
+}
+
+
+int main(int argc, char *argv[])
+{
+    
+    return _main(argc,argv);
+}
+
+int _main(int argc, char *argv[]) 
+{
+    int local_port = 26356;
+    io_flag = FLG_NONE;
+    int daemon = 0; 
+    int opt;
+    char optstrs[] = ":l:h:dED";
+    while(-1 != (opt = getopt(argc, argv, optstrs)))
+    {
+        switch(opt)
+        {
+            case 'l':
+                local_port = atoi(optarg);
+                break;
+            case 'd':
+                daemon = 1;
+                break;
+            case 'E':
+                io_flag = W_S_ENC;
+                break;
+            case 'D':
+                io_flag = R_C_DEC;
+                break;
+            case ':':
+                printf("\nMissing argument after: -%c\n", optopt);
+                usage();
+            case '?':
+                printf("\nInvalid argument: %c\n", optopt);
+            default:
+                usage();
+        }
+    }
+    io_flag = R_C_DEC;
+    start_server(daemon,local_port);
+    return 0;
+
+}
